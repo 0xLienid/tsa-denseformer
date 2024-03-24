@@ -3,9 +3,12 @@ import datetime as dt
 import torch
 import tiktoken
 import wandb
+from dotenv import load_dotenv
 from datasets import load_dataset
 from tsa_denseformer.model import ModelConfig, TSADenseformer
 from utils import count_parameters, tokenize_dataset
+
+load_dotenv()
 
 # Training Run Config
 model_name = "tsa_denseformer"
@@ -26,12 +29,12 @@ dtype = "bfloat16"
 
 model_args = ModelConfig(
     dim=512,
-    n_layers=16,
-    n_heads=16,
-    vocab_size=50000,
-    hidden_dim=2048,
+    n_layers=32,
+    n_heads=32,
+    vocab_size=50256,
+    hidden_dim=4096,
     norm_eps=1e-5,
-    max_batch_size=16,
+    max_batch_size=32,
     max_seq_len=1024
 )
 
@@ -43,8 +46,6 @@ model = TSADenseformer(model_args)
 total_params = count_parameters(model)
 print(f"Total Parameters: {total_params}")
 model.to(device)
-print("compiling model...")
-model = torch.compile(model)
 
 # Create tokenizer
 tokenizer = tiktoken.get_encoding("r50k_base")
@@ -58,13 +59,16 @@ eval_batches = tokenize_dataset(
     dataset["validation"], tokenizer, model_args.max_seq_len, batch_size)
 
 # Initialize wandb
-wandb.init(project=wandb_project, name=run_id)
+wandb.login(key=os.getenv("WANDB_API_KEY"))
+run = wandb.init(project=wandb_project, name=run_id)
+print("wandb run initialized")
 
 # Initialize optimizer and scheduler
 optimizer = torch.optim.AdamW(
     model.parameters(), lr=lr, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     optimizer, lr_decay_steps, min_lr)
+print("optimizer and scheduler initialized")
 
 # Training loop
 global_step = 0
@@ -88,7 +92,7 @@ for epoch in range(epochs):
             optimizer.zero_grad()
 
             print(f"Step: {global_step + 1}, Loss: {loss.item()}")
-            wandb.log({"loss": loss.item()})
+            run.log({"loss": loss.item()})
 
         if (global_step + 1) % eval_steps == 0:
             model.eval()
@@ -103,7 +107,7 @@ for epoch in range(epochs):
 
             eval_loss /= len(eval_batches)
             print(f"Step: {global_step + 1}, Eval Loss: {eval_loss}")
-            wandb.log({"eval_loss": eval_loss})
+            run.log({"eval_loss": eval_loss})
             model.train()
 
         torch.cuda.empty_cache()
