@@ -3,10 +3,9 @@ import datetime as dt
 import torch
 import tiktoken
 import wandb
-from torch.utils.data import DataLoader
 from datasets import load_dataset
 from tsa_denseformer.model import ModelConfig, TSADenseformer
-from utils import count_parameters
+from utils import count_parameters, tokenize_dataset
 
 # Training Run Config
 model_name = "tsa_denseformer"
@@ -53,13 +52,10 @@ tokenizer = tiktoken.get_encoding("r50k_base")
 # Load dataset
 print("loading dataset...")
 dataset = load_dataset(dataset_name)
-tokenized_dataset = dataset.map(
-    lambda x: tokenizer(x["text"], truncation=True, padding="max_length"))
-train_dataloader = DataLoader(
-    tokenized_dataset["train"], batch_size=batch_size, shuffle=True)
-eval_dataloader = DataLoader(
-    tokenized_dataset["validation"], batch_size=batch_size, shuffle=False)
-
+train_batches = tokenize_dataset(
+    dataset["train"], tokenizer, model_args.max_seq_len, batch_size)
+eval_batches = tokenize_dataset(
+    dataset["validation"], tokenizer, model_args.max_seq_len, batch_size)
 
 # Initialize wandb
 wandb.init(project=wandb_project, name=run_id)
@@ -77,9 +73,9 @@ for epoch in range(epochs):
     epoch_loss = 0.0
     optimizer.zero_grad()
 
-    for batch in train_dataloader:
-        inputs = batch["input_ids"].to(device)
-        targets = inputs.clone()
+    for batch in train_batches:
+        inputs = batch["inputs"].to(device)
+        targets = batch["targets"].to(device)
 
         outputs, loss = model(inputs, targets=targets)
 
@@ -97,7 +93,7 @@ for epoch in range(epochs):
         if (global_step + 1) % eval_steps == 0:
             model.eval()
             eval_loss = 0.0
-            for eval_batch in eval_dataloader:
+            for eval_batch in eval_batches:
                 eval_inputs = eval_batch["input_ids"].to(device)
                 eval_targets = eval_inputs.clone()
 
@@ -105,7 +101,7 @@ for epoch in range(epochs):
                     eval_inputs, targets=eval_targets)
                 eval_loss += eval_loss.item()
 
-            eval_loss /= len(eval_dataloader)
+            eval_loss /= len(eval_batches)
             print(f"Step: {global_step + 1}, Eval Loss: {eval_loss}")
             wandb.log({"eval_loss": eval_loss})
             model.train()
@@ -118,7 +114,7 @@ for epoch in range(epochs):
         if global_step >= training_steps:
             break
 
-    epoch_loss /= len(train_dataloader)
+    epoch_loss /= len(train_batches)
     print(f"Epoch: {epoch + 1}, Loss: {epoch_loss}")
 
     epoch += 1
