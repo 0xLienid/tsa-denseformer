@@ -60,7 +60,7 @@ eval_batches = tokenize_dataset(
 
 # Initialize wandb
 wandb.login(key=os.getenv("WANDB_API_KEY"))
-run = wandb.init(project=wandb_project, name=run_id)
+run = wandb.init(project=wandb_project, name=model_name + "--" + run_id)
 print("wandb run initialized")
 
 # Initialize optimizer and scheduler
@@ -80,51 +80,61 @@ for epoch in range(epochs):
     for batch in train_batches:
         inputs = batch["inputs"].to(device)
         targets = batch["targets"].to(device)
+        attn_masks = batch["attn_masks"].to(device)
 
-        outputs, loss = model(inputs, targets=targets)
+        _, loss = model(inputs, targets=targets, attn_mask=attn_masks)
 
-        del inputs, targets
+        del inputs, targets, attn_masks
 
         loss = loss / accumulation_steps
         loss.backward()
+        epoch_loss += loss.item()
 
         if (global_step + 1) % accumulation_steps == 0:
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
-            print(f"Step: {global_step + 1}, Loss: {loss.item()}")
+            print(
+                f"Step: {global_step + 1}, Loss: {loss.item() * accumulation_steps}")
             try:
                 run.log({"loss": loss.item()})
             except:
                 print(f"Failed to push {loss.item()} to wandb")
 
+        del loss
+
         if (global_step + 1) % eval_steps == 0:
             model.eval()
-            eval_loss = 0.0
-            for eval_batch in eval_batches:
+            eval_run_loss = 0.0
+            for i, eval_batch in enumerate(eval_batches):
                 eval_inputs = eval_batch["inputs"].to(device)
                 eval_targets = eval_batch["targets"].to(device)
+                eval_attn_masks = eval_batch["attn_masks"].to(device)
 
-                eval_outputs, eval_loss = model(
-                    eval_inputs, targets=eval_targets)
-
-                del eval_inputs, eval_targets
-
+                _, eval_loss = model(
+                    eval_inputs, targets=eval_targets, attn_mask=eval_attn_masks)
                 eval_loss += eval_loss.item()
+                del eval_targets, eval_attn_masks, eval_loss
 
-            eval_loss /= len(eval_batches)
-            print(f"Step: {global_step + 1}, Eval Loss: {eval_loss}")
+                if i == 0:
+                    gen_outputs = model.generate(
+                        eval_inputs[0][:10].unsqueeze(0), max_new_tokens=20)
+                    print(
+                        f"Generated: {tokenizer.decode(gen_outputs[0].tolist())}")
+                    del eval_inputs, gen_outputs
+
+            eval_run_loss /= len(eval_batches)
+            print(f"Step: {global_step + 1}, Eval Loss: {eval_run_loss}")
             try:
-                run.log({"eval_loss": eval_loss})
+                run.log({"eval_loss": eval_run_loss})
             except:
-                print(f"Failed to push {eval_loss} to wandb")
+                print(f"Failed to push {eval_run_loss} to wandb")
             model.train()
 
         torch.cuda.empty_cache()
 
         global_step += 1
-        epoch_loss += loss.item()
 
         if global_step >= training_steps:
             break

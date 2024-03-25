@@ -29,13 +29,12 @@ dtype = "bfloat16"
 
 model_args = ModelArgs(
     dim=512,
-    n_layers=32,
+    n_layers=39,
     n_heads=32,
     vocab_size=50257,
     hidden_dim=2048,
     multiple_of=256,
     norm_eps=1e-5,
-    max_batch_size=8,
     max_seq_len=512,
     dropout=0.0
 )
@@ -83,9 +82,10 @@ for epoch in range(epochs):
         inputs = batch["inputs"].to(device)
         targets = batch["targets"].to(device)
 
-        outputs, loss = model(inputs, targets=targets)
+        model(inputs, targets=targets)
+        loss = model.last_loss
 
-        del inputs, targets, outputs
+        del inputs, targets
 
         loss = loss / accumulation_steps
         loss.backward()
@@ -107,16 +107,21 @@ for epoch in range(epochs):
         if (global_step + 1) % eval_steps == 0:
             model.eval()
             eval_run_loss = 0.0
-            for eval_batch in eval_batches:
+            for i, eval_batch in enumerate(eval_batches):
                 eval_inputs = eval_batch["inputs"].to(device)
                 eval_targets = eval_batch["targets"].to(device)
 
-                eval_outputs, eval_loss = model(
-                    eval_inputs, targets=eval_targets)
-                gen_outputs = model.generate(eval_inputs[0], max_new_tokens=20)
-                print(f"Generated: {tokenizer.decode(gen_outputs)}")
+                model(eval_inputs, targets=eval_targets)
+                eval_loss = model.last_loss
 
-                del eval_inputs, eval_targets, eval_outputs, gen_outputs
+                if i == 0:
+                    gen_outputs = model.generate(
+                        eval_inputs[0][:10].unsqueeze(0), max_new_tokens=20)
+                    print(
+                        f"Generated: {tokenizer.decode(gen_outputs[0].tolist())}")
+                    del gen_outputs
+
+                del eval_inputs, eval_targets
 
                 eval_run_loss += eval_loss.item()
                 del eval_loss

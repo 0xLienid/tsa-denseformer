@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 from torch import nn
 from .denseformers.modules import DWAModules
+from ..utils import precompute_freqs_cis, reshape_for_broadcast, apply_rotary_emb, repeat_kv
 import torch.nn.functional as F
 
 
@@ -47,42 +48,86 @@ class RMSNorm(nn.Module):
         return output * self.weight
 
 
-class AttentionHead(nn.Module):
-    def __init__(self, head_size: int, config: ModelConfig):
-        super().__init__()
-        self.key = nn.Linear(config.dim, head_size, bias=False)
-        self.query = nn.Linear(config.dim, head_size, bias=False)
-        self.value = nn.Linear(config.dim, head_size, bias=False)
-        self.register_buffer("tril", torch.tril(
-            torch.ones(config.max_seq_len, config.max_seq_len)))
-
-    def forward(self, x, pos_emb):
-        B, T, E = x.shape
-        k = self.key(pos_emb)
-        q = self.query(x)
-
-        scores = q @ k.transpose(-2, -1) * E**-0.5
-        scores = scores.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        scores = F.softmax(scores, dim=-1)
-
-        v = self.value(x)
-        out = scores @ v
-
-        return out
-
-
-class CausalAttention(nn.Module):
+class Attention(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.head_size = config.dim // config.n_heads
-        self.heads = nn.ModuleList(
-            [AttentionHead(self.head_size, config) for _ in range(config.n_heads)])
-        self.proj = nn.Linear(config.dim, config.dim)
+        self.n_kv_heads = config.n_heads
+        model_parallel_size = 1
+        self.n_local_heads = config.n_heads // model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = config.dim // config.n_heads
+        self.wq = nn.Linear(config.dim, config.n_heads *
+                            self.head_dim, bias=False)
+        self.wk = nn.Linear(config.dim, self.n_kv_heads *
+                            self.head_dim, bias=False)
+        self.wv = nn.Linear(config.dim, self.n_kv_heads *
+                            self.head_dim, bias=False)
+        self.wo = nn.Linear(config.n_heads * self.head_dim,
+                            config.dim, bias=False)
 
-    def forward(self, x, pos_emb):
-        out = torch.cat([head(x, pos_emb=pos_emb)
-                        for head in self.heads], dim=-1)
-        return self.proj(out)
+        self.flash = hasattr(torch.nn.functional,
+                             "scaled_dot_product_attention")
+
+        if not self.flash:
+            print(
+                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            mask = torch.full(
+                (1, 1, config.max_seq_len, config.max_seq_len), float("-inf"))
+            mask = torch.triu(mask, diagonal=1)
+            self.register_buffer("mask", mask)
+
+        def forward(
+            self,
+            x: torch.Tensor,
+            pos_emb: torch.Tensor,
+            freqs_cos: torch.Tensor,
+            freqs_sin: torch.Tensor,
+            attn_mask: Optional[torch.Tensor] = None,
+        ):
+            bsz, seqlen, _ = x.shape
+
+            # QKV
+            xq, posk, xv = self.wq(x), self.wk(pos_emb), self.wv(x)
+
+            # RoPE relative positional embeddings
+            xq, posk = apply_rotary_emb(xq, posk, freqs_cos, freqs_sin)
+
+            # grouped multiquery attention: expand out keys and values
+            posk = repeat_kv(posk, self.n_rep)
+            xv = repeat_kv(xv, self.n_rep)
+
+            # make heads into a batch dimension
+            xq = xq.transpose(1, 2)
+            posk = posk.transpose(1, 2)
+            xv = xv.transpose(1, 2)
+
+            # Combine the causal mask with the padding attention mask
+            if attn_mask is not None:
+                # Convert the padding mask to the correct format: 0 for tokens to be masked, 1 for others
+                # Then scale it to -inf for masked positions
+                attn_mask = attn_mask.unsqueeze(1).repeat(1, seqlen, 1)
+                attn_mask = (attn_mask == 0).to(x.dtype) * float("-inf")
+                combined_mask = self.mask[:, :, :seqlen,
+                                          :seqlen] + attn_mask.unsqueeze(1)
+            else:
+                combined_mask = self.mask[:, :, :seqlen, :seqlen]
+
+            # attention
+            if self.flash:
+                output = F.scaled_dot_product_attention(
+                    xq, posk, xv, attn_mask=combined_mask)
+            else:
+                scores = (xq @ posk.transpose(2, 3)) / math.sqrt(self.head_dim)
+                assert hasattr(self, "mask")
+                # TODO: add additional attention mask for padding
+                scores = scores + combined_mask
+                scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+                output = scores @ xv
+
+            # restore time as batch dimension and concat heads
+            output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+            return self.wo(output)
 
 
 class FeedForward(nn.Module):
@@ -101,16 +146,25 @@ class TSATransformerBlock(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.lc_weight = nn.Parameter(torch.randn(1))
-        self.attention = CausalAttention(config)
+        self.attention = Attention(config)
         self.feed_forward = FeedForward(config)
         self.norm1 = RMSNorm(config.dim, config.norm_eps)
         self.norm2 = RMSNorm(config.dim, config.norm_eps)
 
-    def forward(self, x, x_token, pos_emb):
+    def forward(
+        self,
+        x,
+        x_token,
+        pos_emb,
+        freqs_cos,
+        freqs_sin,
+        attn_mask: Optional[torch.Tensor] = None
+    ):
         normalized_lc_weight = torch.sigmoid(self.lc_weight)
         x_attention = normalized_lc_weight * x + \
             (1 - normalized_lc_weight) * x_token
-        x = x + self.attention(self.norm1(x_attention), pos_emb=pos_emb)
+        x = x + self.attention(self.norm1(x_attention), pos_emb=pos_emb,
+                               freqs_cos=freqs_cos, freqs_sin=freqs_sin, attn_mask=attn_mask)
         x = x + self.feed_forward(self.norm2(x))
         return x
 
@@ -133,7 +187,21 @@ class TSADenseformer(nn.Module):
         self.norm = RMSNorm(config.dim, config.norm_eps)
         self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
 
-    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None):
+        # tie the unembedding parameters with the embedding parameters
+        self.tok_embeddings.weight = self.lm_head.weight
+
+        # precompute the RoPE frequencies
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            config.dim // config.n_heads, config.max_seq_len)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None
+    ):
         B, T = tokens.shape
 
         x = self.tok_embeddings(tokens)
@@ -141,21 +209,52 @@ class TSADenseformer(nn.Module):
             torch.arange(T, dtype=torch.long, device="cuda"))
         x_token_space = self.pseudo_embedding(tokens)
 
+        freqs_cos = self.freqs_cos[:T]
+        freqs_sin = self.freqs_sin[:T]
+
         self.dwa_modules.init_accumulators(x)
 
         for i, block in enumerate(self.blocks):
-            x = block(x, x_token=x_token_space, pos_emb=pos_emb)
+            x = block(x, x_token=x_token_space, pos_emb=pos_emb,
+                      freqs_cos=freqs_cos, freqs_sin=freqs_sin, attn_mask=attn_mask)
             x = self.dwa_modules(x, block_idx=i)
 
         x = self.norm(x)
-        logits = self.lm_head(x)
 
         if targets is None:
+            logits = self.lm_head(x[:, [-1], :])
             loss = None
         else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
+            logits = self.lm_head(x)
+
+            targets = targets.view(-1)
+            attn_mask = attn_mask.view(-1)
+            targets[attn_mask == 0] = -100
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                   targets, ignore_index=-100)
 
         return logits, loss
+
+    @torch.inference_mode()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(
+                1) <= self.config.max_seq_len else idx[:, -self.config.max_seq_len:]
+            logits = self(idx_cond)
+            logits = logits[:, -1, :]
+
+            if temperature == 0.0:
+                _, idx_next = torch.topk(logits, k=1, dim=-1)
+            else:
+                logits = logits / temperature
+
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+
+            idx = torch.cat([idx, idx_next], dim=-1)
+
+        return idx
