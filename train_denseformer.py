@@ -15,13 +15,13 @@ model_name = "tsa_denseformer"
 run_id = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 epochs = 1
 accumulation_steps = 16
-batch_size = 32
+batch_size = 8
 lr = 3e-4
 min_lr = 3e-5
 eval_steps = 250
 training_steps = 10000
 weight_decay = 0.01
-lr_decay_steps = training_steps
+lr_decay_steps = training_steps // accumulation_steps
 dataset_name = "roneneldan/TinyStories"
 wandb_project = "tsa-denseformer-experiments"
 device = "cuda"
@@ -31,11 +31,11 @@ model_args = ModelConfig(
     dim=512,
     n_layers=32,
     n_heads=32,
-    vocab_size=50256,
-    hidden_dim=4096,
+    vocab_size=50257,
+    hidden_dim=2048,
     norm_eps=1e-5,
-    max_batch_size=32,
-    max_seq_len=1024
+    max_batch_size=8,
+    max_seq_len=512
 )
 
 # Setup
@@ -54,9 +54,9 @@ tokenizer = tiktoken.get_encoding("r50k_base")
 print("loading dataset...")
 dataset = load_dataset(dataset_name)
 train_batches = tokenize_dataset(
-    dataset["train"], tokenizer, model_args.max_seq_len, batch_size)
+    dataset["train"], tokenizer, model_args.max_seq_len, batch_size, 10000)
 eval_batches = tokenize_dataset(
-    dataset["validation"], tokenizer, model_args.max_seq_len, batch_size)
+    dataset["validation"], tokenizer, model_args.max_seq_len, batch_size, 50)
 
 # Initialize wandb
 wandb.login(key=os.getenv("WANDB_API_KEY"))
@@ -75,7 +75,7 @@ global_step = 0
 
 for epoch in range(epochs):
     epoch_loss = 0.0
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
     for batch in train_batches:
         inputs = batch["inputs"].to(device)
@@ -83,31 +83,42 @@ for epoch in range(epochs):
 
         outputs, loss = model(inputs, targets=targets)
 
+        del inputs, targets
+
         loss = loss / accumulation_steps
         loss.backward()
 
         if (global_step + 1) % accumulation_steps == 0:
             optimizer.step()
             scheduler.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             print(f"Step: {global_step + 1}, Loss: {loss.item()}")
-            run.log({"loss": loss.item()})
+            try:
+                run.log({"loss": loss.item()})
+            except:
+                print(f"Failed to push {loss.item()} to wandb")
 
         if (global_step + 1) % eval_steps == 0:
             model.eval()
             eval_loss = 0.0
             for eval_batch in eval_batches:
-                eval_inputs = eval_batch["input_ids"].to(device)
-                eval_targets = eval_inputs.clone()
+                eval_inputs = eval_batch["inputs"].to(device)
+                eval_targets = eval_batch["targets"].to(device)
 
                 eval_outputs, eval_loss = model(
                     eval_inputs, targets=eval_targets)
+
+                del eval_inputs, eval_targets
+
                 eval_loss += eval_loss.item()
 
             eval_loss /= len(eval_batches)
             print(f"Step: {global_step + 1}, Eval Loss: {eval_loss}")
-            run.log({"eval_loss": eval_loss})
+            try:
+                run.log({"eval_loss": eval_loss})
+            except:
+                print(f"Failed to push {eval_loss} to wandb")
             model.train()
 
         torch.cuda.empty_cache()

@@ -15,13 +15,13 @@ def tokenize_batch(examples, tokenizer, max_seq_len):
         if len(id) < max_seq_len:
             input_ids[i] = id + [50256] * (max_seq_len - len(id))
 
-        targets.append(id[1:] + [50256])
+        targets.append(input_ids[i][1:] + [50256])
         assert len(input_ids[i]) == len(targets[i])
 
-    return torch.tensor(input_ids, dtype=torch.long), torch.tensor(targets, dtype=torch.long)
+    return torch.tensor(input_ids, dtype=torch.long, device="cpu"), torch.tensor(targets, dtype=torch.long, device="cpu")
 
 
-def tokenize_dataset(dataset, tokenizer, max_seq_len, batch_size):
+def tokenize_dataset(dataset, tokenizer, max_seq_len, batch_size, num_batches):
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     batches = []
@@ -35,7 +35,7 @@ def tokenize_dataset(dataset, tokenizer, max_seq_len, batch_size):
         batches.append(batch_dict)
 
         batch_i += 1
-        if batch_i >= 10000:
+        if batch_i >= num_batches:
             break
 
     return batches

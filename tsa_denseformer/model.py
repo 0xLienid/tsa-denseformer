@@ -3,7 +3,7 @@ import torch
 from dataclasses import dataclass
 from typing import Optional
 from torch import nn
-from denseformers.modules import DWAModules
+from .denseformers.modules import DWAModules
 import torch.nn.functional as F
 
 
@@ -88,9 +88,9 @@ class CausalAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        w1 = nn.Linear(config.dim, config.hidden_dim)
-        w2 = nn.Linear(config.hidden_dim, config.dim)
-        w3 = nn.Linear(config.dim, config.hidden_dim)
+        self.w1 = nn.Linear(config.dim, config.hidden_dim)
+        self.w2 = nn.Linear(config.hidden_dim, config.dim)
+        self.w3 = nn.Linear(config.dim, config.hidden_dim)
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -135,8 +135,10 @@ class TSADenseformer(nn.Module):
 
     def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None):
         B, T = tokens.shape
+
         x = self.tok_embeddings(tokens)
-        pos_emb = self.pos_embeddings(torch.arange(T, device=tokens.device))
+        pos_emb = self.pos_embeddings(
+            torch.arange(T, dtype=torch.long, device="cuda"))
         x_token_space = self.pseudo_embedding(tokens)
 
         self.dwa_modules.init_accumulators(x)
