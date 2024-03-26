@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 from torch import nn
 from .denseformers.modules import DWAModules
-from ..utils import precompute_freqs_cis, reshape_for_broadcast, apply_rotary_emb, repeat_kv
+from .utils import precompute_freqs_cis, reshape_for_broadcast, apply_rotary_emb, repeat_kv
 import torch.nn.functional as F
 
 
@@ -13,11 +13,12 @@ class ModelConfig:
     dim: int = 4096
     n_layers: int = 32
     n_heads: int = 32
-    vocab_size: int = -1
+    vocab_size: int = 50257
     hidden_dim: int = 4 * dim
     norm_eps: float = 1e-5
     max_batch_size: int = 32
     max_seq_len: int = 2048
+    dropout: float = 0.0
 
 
 class PseudoEmbedding(nn.Module):
@@ -65,80 +66,89 @@ class Attention(nn.Module):
                             self.head_dim, bias=False)
         self.wo = nn.Linear(config.n_heads * self.head_dim,
                             config.dim, bias=False)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
 
+        self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional,
                              "scaled_dot_product_attention")
 
-        if not self.flash:
-            print(
-                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            mask = torch.full(
-                (1, 1, config.max_seq_len, config.max_seq_len), float("-inf"))
-            mask = torch.triu(mask, diagonal=1)
-            self.register_buffer("mask", mask)
+        mask = torch.full(
+            (1, 1, config.max_seq_len, config.max_seq_len), torch.finfo(torch.bfloat16).min)
+        mask = torch.triu(mask, diagonal=1)
+        self.register_buffer("mask", mask)
 
-        def forward(
-            self,
-            x: torch.Tensor,
-            pos_emb: torch.Tensor,
-            freqs_cos: torch.Tensor,
-            freqs_sin: torch.Tensor,
-            attn_mask: Optional[torch.Tensor] = None,
-        ):
-            bsz, seqlen, _ = x.shape
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ):
+        bsz, seqlen, _ = x.shape
 
-            # QKV
-            xq, posk, xv = self.wq(x), self.wk(pos_emb), self.wv(x)
+        # QKV
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-            # RoPE relative positional embeddings
-            xq, posk = apply_rotary_emb(xq, posk, freqs_cos, freqs_sin)
+        # RoPE relative positional embeddings
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
 
-            # grouped multiquery attention: expand out keys and values
-            posk = repeat_kv(posk, self.n_rep)
-            xv = repeat_kv(xv, self.n_rep)
+        # grouped multiquery attention: expand out keys and values
+        xk = repeat_kv(xk, self.n_rep)
+        xv = repeat_kv(xv, self.n_rep)
 
-            # make heads into a batch dimension
-            xq = xq.transpose(1, 2)
-            posk = posk.transpose(1, 2)
-            xv = xv.transpose(1, 2)
+        # make heads into a batch dimension
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
 
-            # Combine the causal mask with the padding attention mask
-            if attn_mask is not None:
-                # Convert the padding mask to the correct format: 0 for tokens to be masked, 1 for others
-                # Then scale it to -inf for masked positions
-                attn_mask = attn_mask.unsqueeze(1).repeat(1, seqlen, 1)
-                attn_mask = (attn_mask == 0).to(x.dtype) * float("-inf")
-                combined_mask = self.mask[:, :, :seqlen,
-                                          :seqlen] + attn_mask.unsqueeze(1)
-            else:
-                combined_mask = self.mask[:, :, :seqlen, :seqlen]
+        # Combine the causal mask with the padding attention mask
+        if attn_mask is not None:
+            # Convert the padding mask to the correct format: 0 for tokens to be masked, 1 for others
+            # Then scale it to min bfloat16 for masked positions
+            attn_mask = attn_mask.unsqueeze(1).repeat(
+                1, seqlen, 1).to(dtype=x.dtype)
+            attn_mask = attn_mask.masked_fill(attn_mask == 0, torch.finfo(
+                torch.bfloat16).min).masked_fill(attn_mask == 1, 0)
+            combined_mask = self.mask[:, :, :seqlen,
+                                      :seqlen] + attn_mask.unsqueeze(1)
+        else:
+            combined_mask = self.mask[:, :, :seqlen, :seqlen]
 
-            # attention
-            if self.flash:
-                output = F.scaled_dot_product_attention(
-                    xq, posk, xv, attn_mask=combined_mask)
-            else:
-                scores = (xq @ posk.transpose(2, 3)) / math.sqrt(self.head_dim)
-                assert hasattr(self, "mask")
-                # TODO: add additional attention mask for padding
-                scores = scores + combined_mask
-                scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-                output = scores @ xv
+        # attention
+        if self.flash:
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv, attn_mask=combined_mask, dropout_p=self.dropout)
+        else:
+            scores = (xq @ xk.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-            # restore time as batch dimension and concat heads
-            output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-            return self.wo(output)
+            assert hasattr(self, "mask")
+            # TODO: add additional attention mask for padding
+            scores = scores + combined_mask
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = scores @ xv
+
+        # restore time as batch dimension and concat heads
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        output = self.wo(output)
+        output = self.resid_dropout(output)
+        return output
 
 
 class FeedForward(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.w1 = nn.Linear(config.dim, config.hidden_dim)
-        self.w2 = nn.Linear(config.hidden_dim, config.dim)
-        self.w3 = nn.Linear(config.dim, config.hidden_dim)
+        self.w1 = nn.Linear(config.dim, config.hidden_dim, bias=False)
+        self.w2 = nn.Linear(config.hidden_dim, config.dim, bias=False)
+        self.w3 = nn.Linear(config.dim, config.hidden_dim, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 
 class TSATransformerBlock(nn.Module):
@@ -155,7 +165,6 @@ class TSATransformerBlock(nn.Module):
         self,
         x,
         x_token,
-        pos_emb,
         freqs_cos,
         freqs_sin,
         attn_mask: Optional[torch.Tensor] = None
@@ -163,7 +172,7 @@ class TSATransformerBlock(nn.Module):
         normalized_lc_weight = torch.sigmoid(self.lc_weight)
         x_attention = normalized_lc_weight * x + \
             (1 - normalized_lc_weight) * x_token
-        x = x + self.attention(self.norm1(x_attention), pos_emb=pos_emb,
+        x = x + self.attention(self.norm1(x_attention),
                                freqs_cos=freqs_cos, freqs_sin=freqs_sin, attn_mask=attn_mask)
         x = x + self.feed_forward(self.norm2(x))
         return x
@@ -175,8 +184,8 @@ class TSADenseformer(nn.Module):
         self.config = config
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
-        self.pos_embeddings = nn.Embedding(config.max_seq_len, config.dim)
         self.pseudo_embedding = PseudoEmbedding(config.vocab_size, config.dim)
+        self.dropout = nn.Dropout(config.dropout)
 
         self.dwa_modules = DWAModules(config.n_layers, 1, 3)
 
@@ -196,6 +205,23 @@ class TSADenseformer(nn.Module):
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
+        # init all weights
+        self.apply(self._init_weights)
+
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
+                torch.nn.init.normal_(
+                    p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layers))
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(
         self,
         tokens: torch.Tensor,
@@ -205,8 +231,7 @@ class TSADenseformer(nn.Module):
         B, T = tokens.shape
 
         x = self.tok_embeddings(tokens)
-        pos_emb = self.pos_embeddings(
-            torch.arange(T, dtype=torch.long, device="cuda"))
+        x = self.dropout(x)
         x_token_space = self.pseudo_embedding(tokens)
 
         freqs_cos = self.freqs_cos[:T]
@@ -215,7 +240,16 @@ class TSADenseformer(nn.Module):
         self.dwa_modules.init_accumulators(x)
 
         for i, block in enumerate(self.blocks):
-            x = block(x, x_token=x_token_space, pos_emb=pos_emb,
+            has_nan = torch.isnan(x).any().item()
+            if has_nan:
+                print(
+                    f"tokens: {tokens}, {torch.isnan(tokens).any().item()}, {torch.max(tokens).item()}, {torch.min(tokens).item()}")
+                print(f"mask: {attn_mask}")
+                print(
+                    f"x: {torch.isnan(x).any().item()}, {torch.max(x).item()}, {torch.min(x).item()}")
+                raise Exception("break")
+
+            x = block(x, x_token=x_token_space,
                       freqs_cos=freqs_cos, freqs_sin=freqs_sin, attn_mask=attn_mask)
             x = self.dwa_modules(x, block_idx=i)
 
@@ -241,7 +275,7 @@ class TSADenseformer(nn.Module):
             idx_cond = idx if idx.size(
                 1) <= self.config.max_seq_len else idx[:, -self.config.max_seq_len:]
             logits = self(idx_cond)
-            logits = logits[:, -1, :]
+            logits = logits[0][:, -1, :]
 
             if temperature == 0.0:
                 _, idx_next = torch.topk(logits, k=1, dim=-1)
@@ -253,7 +287,11 @@ class TSADenseformer(nn.Module):
                     logits[logits < v[:, [-1]]] = -float('Inf')
 
                 probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
+                try:
+                    idx_next = torch.multinomial(probs, num_samples=1)
+                except Exception as e:
+                    idx_next = torch.tensor([50256]).unsqueeze(0)
+                    print(f"Error: {e}, probs tensor: {probs}")
 
             idx = torch.cat([idx, idx_next], dim=-1)
 

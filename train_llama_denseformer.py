@@ -14,7 +14,7 @@ load_dotenv()
 model_name = "llama_denseformer"
 run_id = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 epochs = 1
-accumulation_steps = 16
+accumulation_steps = 4
 batch_size = 8
 lr = 3e-4
 min_lr = 3e-5
@@ -22,6 +22,7 @@ eval_steps = 250
 training_steps = 10000
 weight_decay = 0.01
 lr_decay_steps = training_steps // accumulation_steps
+grad_clip = 1.0
 dataset_name = "roneneldan/TinyStories"
 wandb_project = "tsa-denseformer-experiments"
 device = "cuda"
@@ -29,7 +30,7 @@ dtype = "bfloat16"
 
 model_args = ModelArgs(
     dim=512,
-    n_layers=39,
+    n_layers=33,
     n_heads=32,
     vocab_size=50257,
     hidden_dim=2048,
@@ -65,6 +66,7 @@ run = wandb.init(project=wandb_project, name=model_name + "--" + run_id)
 print("wandb run initialized")
 
 # Initialize optimizer and scheduler
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 optimizer = torch.optim.AdamW(
     model.parameters(), lr=lr, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -81,24 +83,39 @@ for epoch in range(epochs):
     for batch in train_batches:
         inputs = batch["inputs"].to(device)
         targets = batch["targets"].to(device)
+        attn_masks = batch["attn_masks"].to(device)
 
-        model(inputs, targets=targets)
+        model(inputs, targets=targets, attn_mask=attn_masks)
         loss = model.last_loss
 
         del inputs, targets
 
         loss = loss / accumulation_steps
-        loss.backward()
+        scaler.scale(loss).backward()
         epoch_loss += loss.item()
 
         if (global_step + 1) % accumulation_steps == 0:
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
+
+            total_norm = 0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.detach().data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+
+            if grad_clip != 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
             optimizer.zero_grad(set_to_none=True)
 
-            print(f"Step: {global_step + 1}, Loss: {loss.item()}")
+            print(
+                f"Step: {global_step + 1}, Loss: {loss.item() * accumulation_steps}")
             try:
-                run.log({"loss": loss.item()})
+                run.log({"loss": loss.item(), "grad_norm": total_norm})
             except:
                 print(f"Failed to push {loss.item()} to wandb")
 
@@ -110,8 +127,10 @@ for epoch in range(epochs):
             for i, eval_batch in enumerate(eval_batches):
                 eval_inputs = eval_batch["inputs"].to(device)
                 eval_targets = eval_batch["targets"].to(device)
+                eval_attn_masks = eval_batch["attn_masks"].to(device)
 
-                model(eval_inputs, targets=eval_targets)
+                model(eval_inputs, targets=eval_targets,
+                      attn_mask=eval_attn_masks)
                 eval_loss = model.last_loss
 
                 if i == 0:

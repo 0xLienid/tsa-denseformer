@@ -121,19 +121,18 @@ class Attention(nn.Module):
         # use flash attention or a manual implementation?
         self.flash = hasattr(torch.nn.functional,
                              'scaled_dot_product_attention')
-        if not self.flash:
-            print(
-                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            mask = torch.full(
-                (1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
-            mask = torch.triu(mask, diagonal=1)
-            self.register_buffer("mask", mask)
+
+        mask = torch.full(
+            (1, 1, args.max_seq_len, args.max_seq_len), torch.finfo(torch.bfloat16).min)
+        mask = torch.triu(mask, diagonal=1)
+        self.register_buffer("mask", mask)
 
     def forward(
         self,
         x: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None
     ):
         bsz, seqlen, _ = x.shape
 
@@ -155,17 +154,28 @@ class Attention(nn.Module):
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
 
+        if attn_mask is not None:
+            attn_mask = attn_mask.unsqueeze(1).repeat(
+                1, seqlen, 1).to(dtype=x.dtype)
+            attn_mask = attn_mask.masked_fill(attn_mask == 0, torch.finfo(
+                torch.bfloat16).min).masked_fill(attn_mask == 1, 0)
+            combined_mask = self.mask[:, :, :seqlen,
+                                      :seqlen] + attn_mask.unsqueeze(1)
+        else:
+            combined_mask = self.mask[:, :, :seqlen, :seqlen]
+
         # flash implementation
         if self.flash:
             output = torch.nn.functional.scaled_dot_product_attention(
-                xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+                xq, xk, xv, attn_mask=combined_mask)
         else:
             # manual implementation
             scores = torch.matmul(xq, xk.transpose(2, 3)) / \
                 math.sqrt(self.head_dim)
+
             assert hasattr(self, 'mask')
             # (bs, n_local_heads, seqlen, cache_len + seqlen)
-            scores = scores + self.mask[:, :, :seqlen, :seqlen]
+            scores = scores + combined_mask
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             # (bs, n_local_heads, seqlen, head_dim)
@@ -214,10 +224,16 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x, freqs_cos, freqs_sin):
+    def forward(
+        self,
+        x,
+        freqs_cos,
+        freqs_sin,
+        attn_mask: Optional[torch.Tensor] = None
+    ):
         h = x + \
             self.attention.forward(
-                self.attention_norm(x), freqs_cos, freqs_sin)
+                self.attention_norm(x), freqs_cos, freqs_sin, attn_mask)
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 
@@ -269,7 +285,12 @@ class Transformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
@@ -279,7 +300,14 @@ class Transformer(nn.Module):
         self.dwa_modules.init_accumulators(h)
 
         for i, layer in enumerate(self.layers):
-            h = layer(h, freqs_cos, freqs_sin)
+            has_nan = torch.isnan(h).any().item()
+            if has_nan:
+                print(
+                    f"tokens: {tokens}, {torch.isnan(tokens).any().item()}, {torch.max(tokens).item()}, {torch.min(tokens).item()}")
+                print(
+                    f"h: {torch.isnan(h).any().item()}, {torch.max(h).item()}, {torch.min(h).item()}")
+                raise Exception("break")
+            h = layer(h, freqs_cos, freqs_sin, attn_mask)
             h = self.dwa_modules(h, block_idx=i)
 
         h = self.norm(h)
@@ -287,8 +315,12 @@ class Transformer(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.output(h)
+
+            targets = targets.view(-1)
+            attn_mask = attn_mask.view(-1)
+            targets[attn_mask == 0] = -100
             self.last_loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                logits.view(-1, logits.size(-1)), targets, ignore_index=-100)
         else:
             # inference-time mini-optimization: only forward the output on the very last position
             # note: using list [-1] to preserve the time dim
@@ -324,7 +356,11 @@ class Transformer(nn.Module):
                     logits[logits < v[:, [-1]]] = -float('Inf')
                 # apply softmax to convert logits to (normalized) probabilities
                 probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
+                try:
+                    idx_next = torch.multinomial(probs, num_samples=1)
+                except Exception as e:
+                    idx_next = torch.tensor([50256]).unsqueeze(0).to("cuda")
+                    print(f"Error: {e}, probs tensor: {probs}")
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 

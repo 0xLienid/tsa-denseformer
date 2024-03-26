@@ -14,7 +14,7 @@ load_dotenv()
 model_name = "tsa_denseformer"
 run_id = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 epochs = 1
-accumulation_steps = 16
+accumulation_steps = 4
 batch_size = 8
 lr = 3e-4
 min_lr = 3e-5
@@ -22,6 +22,7 @@ eval_steps = 250
 training_steps = 10000
 weight_decay = 0.01
 lr_decay_steps = training_steps // accumulation_steps
+grad_clip = 1.0
 dataset_name = "roneneldan/TinyStories"
 wandb_project = "tsa-denseformer-experiments"
 device = "cuda"
@@ -35,7 +36,8 @@ model_args = ModelConfig(
     hidden_dim=2048,
     norm_eps=1e-5,
     max_batch_size=8,
-    max_seq_len=512
+    max_seq_len=512,
+    dropout=0.0
 )
 
 # Setup
@@ -64,6 +66,7 @@ run = wandb.init(project=wandb_project, name=model_name + "--" + run_id)
 print("wandb run initialized")
 
 # Initialize optimizer and scheduler
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 optimizer = torch.optim.AdamW(
     model.parameters(), lr=lr, weight_decay=weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -87,18 +90,31 @@ for epoch in range(epochs):
         del inputs, targets, attn_masks
 
         loss = loss / accumulation_steps
-        loss.backward()
+        scaler.scale(loss).backward()
         epoch_loss += loss.item()
 
         if (global_step + 1) % accumulation_steps == 0:
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
+
+            total_norm = 0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.detach().data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+
+            if grad_clip != 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
             optimizer.zero_grad(set_to_none=True)
 
             print(
                 f"Step: {global_step + 1}, Loss: {loss.item() * accumulation_steps}")
             try:
-                run.log({"loss": loss.item()})
+                run.log({"loss": loss.item(), "grad_norm": total_norm})
             except:
                 print(f"Failed to push {loss.item()} to wandb")
 
@@ -114,7 +130,7 @@ for epoch in range(epochs):
 
                 _, eval_loss = model(
                     eval_inputs, targets=eval_targets, attn_mask=eval_attn_masks)
-                eval_loss += eval_loss.item()
+                eval_run_loss += eval_loss.item()
                 del eval_targets, eval_attn_masks, eval_loss
 
                 if i == 0:
